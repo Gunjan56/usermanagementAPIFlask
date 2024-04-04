@@ -1,41 +1,21 @@
-from functools import wraps
-import os
-import re
-from flask_mail import Message, Mail
-import base64 
 from flask import (request,jsonify, abort, send_from_directory, g)
 from flask_jwt_extended import (create_access_token, get_jwt_identity, jwt_required)
 from flask_socketio import (emit, send)
+import os
+import re
 from werkzeug.security import (check_password_hash, generate_password_hash)
 from werkzeug.utils import (secure_filename)
 from models.model import (db, User, Post, Message, Liked_Post, Comment, Follow, Role, Permission)
-from utils import create_app,allowed_file
+from utils import (create_app,allowed_file, secure_password, reset_password, forgot_password)
 from helper import ROLES_PERMISSIONS
 from handlers import (bad_request, forbidden, unauthorized, not_found)
-
+from decorator import roles_required
 app, socketio = create_app()
-mail = Mail(app)
 email_validation = r'^[a-zA-Z0-9+_.-]+@[a-zA-Z0-9.-]+$'
-
 app.errorhandler(400)(bad_request)
 app.errorhandler(401)(unauthorized)
 app.errorhandler(403)(forbidden)
 app.errorhandler(404)(not_found)
-
-def secure_password(password):
-    return generate_password_hash(password)    
-
-def roles_required(*roles):
-    def wrapper(fn):
-        @wraps(fn)
-        def decorated_view(*args, **kwargs):
-            current_user_id = get_jwt_identity()
-            user = User.query.get(current_user_id)
-            if user.role not in roles:
-                abort(403, 'Insufficient permissions')
-            return fn(*args, **kwargs)
-        return decorated_view
-    return wrapper
 
 @app.route('/register', methods=['POST'])
 def register():
@@ -88,48 +68,6 @@ def login():
 
     return jsonify(access_token=access_token), 200
 
-@app.route('/forgot_password', methods=['POST'])
-def forgot_password():
-    data = request.get_json()
-    email = data['email']
-    user = User.query.filter_by(email=email).first()
-    
-    if user:
-        reset_token = base64.b64encode(email.encode('utf-8')).decode('utf-8')
-
-        send_reset_password_email(email, reset_token)
-
-        return jsonify({'message': 'Reset password link sent to your email'})
-    else:
-        return jsonify({'message': 'User not found'}), 404
-
-def send_reset_password_email(user_email, reset_token):
-    msg = Message('Reset Your Password', sender=os.getenv('MAIL_USERNAME'), recipients=[user_email])
-    msg.body = f'Reset your password: {reset_token}'
-    mail.send(msg)
-
-
-@app.route('/reset_password/<token>', methods=['POST'])
-def reset_password(token):
-   
-    data = request.get_json()
-    new_password = data['new_password']
-    confirm_password = data['confirm_password']
-    
-    if new_password != confirm_password:
-        return jsonify({'message': 'New password and confirm password do not match'}), 400
-
-    email = base64.b64decode(token).decode('utf-8')
-    
-    user = User.query.filter_by(email=email).first()
-    if user:
-        user.password = generate_password_hash(new_password)
-        db.session.commit()
-        return jsonify({'message': 'Password reset successfully'}), 200
-    else:
-        return jsonify({'message': 'User not found'}), 404
-
-
 @app.route('/profile/picture', methods=['PUT'])
 @jwt_required()
 def update_profile_picture():
@@ -161,6 +99,7 @@ def manage_profile():
         abort(404, 'User not found')
 
     if request.method == 'GET':
+
         followers_count = user.count_followers()
         following_count = user.count_following()
 
@@ -174,21 +113,24 @@ def manage_profile():
   
     elif request.method == 'PUT':
         data = request.json
+        if current_user_id.role != 'administrator':
+            abort(403, 'You are not authorized')
 
         user.username = data.get('username', user.username)
         user.email = data.get('email', user.email)
         user.role = data.get('role', user.role);
-
+        
         if 'profile_picture' in request.files:
-            profile_picture = request.files['profile_picture']
-            if profile_picture and allowed_file(profile_picture.filename):
-                filename = secure_filename(profile_picture.filename)
-                profile_picture.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
-                user.profile_picture = filename
+                profile_picture = request.files['profile_picture']
+                if profile_picture and allowed_file(profile_picture.filename):
+                    filename = secure_filename(profile_picture.filename)
+                    profile_picture.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+                    user.profile_picture = filename
 
         db.session.commit()
 
-        return jsonify({'message': 'Profile updated successfully'}), 200
+        return jsonify({'message': 'User updated successfully'}), 200
+        
 
     elif request.method == 'DELETE':
         db.session.delete(user)
@@ -241,7 +183,7 @@ def create_post():
 
     return jsonify({'message': 'Post created successfully'}), 201
 
-@app.route('/users/<int:user_id>', methods=['DELETE'])
+@app.route('/delete_user/<int:user_id>', methods=['DELETE'])
 @jwt_required()
 @roles_required('administrator')
 def delete_user(user_id):
@@ -253,7 +195,7 @@ def delete_user(user_id):
     return jsonify({'message': 'User deleted successfully'}), 200
 
 
-@app.route('/posts/<int:post_id>', methods=['GET', 'PUT'])
+@app.route('/manage_post/<int:post_id>', methods=['GET', 'PUT'])
 @jwt_required()
 def manage_post(post_id):
     current_user_id = get_jwt_identity()
@@ -268,7 +210,7 @@ def manage_post(post_id):
         abort(404, 'Post not found')
 
     if post.user_id != current_user_id:
-        abort(403, 'You are not authorized to perform this action')
+        abort(403, 'You are not authorized')
 
     if request.method == 'GET':
         return jsonify({
@@ -285,7 +227,7 @@ def manage_post(post_id):
         return jsonify({'message': 'Post updated successfully'}), 200
 
 
-@app.route('/posts/<int:post_id>', methods=['DELETE'])
+@app.route('/delete_post/<int:post_id>', methods=['DELETE'])
 @jwt_required()
 def delete_post(post_id):
     current_user_id = get_jwt_identity()
@@ -392,7 +334,7 @@ def add_comment(post_id):
 
     return jsonify({'message': 'Comment added successfully'}), 201
 
-@app.route('/posts/<int:post_id>/comments/<int:comment_id>', methods=['DELETE'])
+@app.route('/posts/<int:post_id>/delete_comment/<int:comment_id>', methods=['DELETE'])
 @jwt_required()
 def delete_comment(post_id, comment_id):
     current_user_id = get_jwt_identity()
@@ -422,30 +364,38 @@ def delete_comment(post_id, comment_id):
 def uploaded_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
+from flask_jwt_extended import jwt_required, get_jwt_identity
+
 @app.route('/get_posts', methods=['GET'])
 @jwt_required()
 def get_posts():
     current_user_id = get_jwt_identity()
     user = User.query.get(current_user_id)
-    posts = Post.query.all()
-    post_data = []
-    for post in posts:
-        post_dict = {
-            'id': post.id,
-            'content': post.content,
-            'image': post.image,
-            'user_id': post.user_id,
-            'likes': post.count_likes(),  
-            'comments': ([comment.to_json() for comment in post.comments])
-        }
-        post_data.append(post_dict)
     if user:
-        followers_count = len(user.following)
-        following_count = len(user.followers)
+        following_users_ids = [follow.followed_id for follow in user.following]  
+        following_users_ids.append(user.id)  
+        posts = Post.query.filter(Post.user_id.in_(following_users_ids)).all()
+
+        post_data = []
+        for post in posts:
+            post_dict = {
+                'id': post.id,
+                'content': post.content,
+                'image': post.image,
+                'user_id': post.user_id,
+                'comments': [comment.to_json() for comment in post.comments]
+            }
+            post_data.append(post_dict)
+
+        followers_count = len(user.followers) 
+        following_count = len(user.following)
         likes_received = user.count_likes_received()
         post_data.append({"followers_count": followers_count, "following_count": following_count, "likes_received": likes_received})
 
-    return jsonify(post_data), 200
+        return jsonify(post_data), 200
+    else:
+        return jsonify({'message': "You are not following any user"}), 404
+
 
 @app.route('/send_message/<int:recipient_id>', methods=['POST'])
 @jwt_required()
@@ -467,24 +417,40 @@ def send_message(recipient_id):
         sender_id=current_user_id,
         recipient_id=recipient_id,
         content=content
-
     )
 
     db.session.add(message)
     db.session.commit()
- 
-    socketio.emit('new_message', {'sender_id': current_user_id, "content": content}, room=f'user_{recipient_id}')
+
+    socketio.emit('new_message', {'sender_id': current_user_id, 'recipient_id': recipient_id, "content": content}, room=f'user_{recipient_id}')
     return jsonify({'message': 'Message sent successfully'}), 201
 
-@socketio.on('new_message')
-def handle_new_message(data):
-    sender_id = data['sender_id']
-    recipient_id = data['recipient_id']
-    send_message(sender_id, recipient_id, data['content'])
+@socketio.on('message')
+def handle_message(data):
+    message = data.get('content')
+    sender_id = data.get('sender_id')
+    recipient_id = data.get('recipient_id')
+    current_user_id = get_jwt_identity()
+    sender = User.query.get(sender_id)
+    recipient = User.query.get(recipient_id)
+
+    if not sender or not recipient:
+        abort(404, 'Sender or recipient not found')
+
+    message = Message(
+        sender_id=sender_id,
+        recipient_id=recipient_id,
+        content=message
+    )
+    db.session.add(message)
+    db.session.commit()
+    socketio.emit('new_message', {'sender_id': sender_id, 'recipient_id': recipient_id, "content": message}, room=f'user_{recipient_id}')
+    print('Received message:', message)
 
 def send_message(sender_id, recipient_id, content):
     emit('message', {'sender_id': sender_id, 'content': content}, room=f'user_{recipient_id}')
-    
+    socketio.emit('new_message', {'sender_id': sender_id, 'recipient_id': recipient_id, "content": content}, room=f'user_{recipient_id}')
+
 @app.route('/messages', methods=['GET'])
 @jwt_required()
 def get_messages():
@@ -502,7 +468,7 @@ def get_messages():
 
     return jsonify({'sent_messages': sent_messages_data, 'received_messages': received_messages_data}), 200
 
-@app.route('/messages/<int:message_id>', methods=['DELETE'])
+@app.route('/delete_message/<int:message_id>', methods=['DELETE'])
 @jwt_required()
 def delete_message(message_id):
     current_user_id = get_jwt_identity()
@@ -555,3 +521,5 @@ def search():
 
 if __name__ == '__main__':
     socketio.run(app,debug=True, host='localhost', port=5000)
+
+
